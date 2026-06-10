@@ -1,0 +1,41 @@
+name: streetview-deprivation-amsterdam
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - contextily
+  - folium
+  - geopandas
+  - numpy
+  - matplotlib
+  - shapely
+  - jupyter
+  - jupyterlab
+  - pandas
+  - notebook
+  - seaborn
+  - scikit-learn
+  - scipy
+  - statsmodels
+  - sentence-transformers
+  - libgfortran
+  - ipywidgets
+  - setuptools<81
+  - conda-forge::openai-clip
+  - umap-learn
+  - xgboost
+  - kneed
+  - earthengine-api
+  - rasterio
+  - rasterstats
+  - nbdime
+  - openpyxl
+  - h5py
+  - tenacity
+  - pyarrow
+  - requests
+  - pip
+  - pip:
+      # Equirectangular panorama -> perspective (rectilinear) reprojection.
+      # Used by panorama_acquisition.py to make four 90-deg FOV crops per panorama.
+      - py360convert
