@@ -54,9 +54,13 @@ the sampling reproducible. Set `TARGET_N = None` to keep the full ~1M-point set.
 
 The work list (`panorama_worklist.parquet`) is stamped with the settings it was built from
 (`panorama_worklist.parquet.meta.json`: target size, stratum, spacing floor, seed, tile size, AOI,
-image variant, dev bbox) and **auto-rebuilds** whenever any of those change — so editing `TARGET_N`
-(etc.) at the top of the script is sufficient; you don't need to remember `--rebuild-worklist` (which
-remains as a manual override). Re-running with unchanged settings reuses the cached list. Re-thinning
+image variant, dev bbox, **and `WORKLIST_LOGIC_VERSION`** — a hand-bumped version of the build code
+itself) and **auto-rebuilds** whenever any of those change — so editing `TARGET_N` (etc.) at the top
+of the script, or fixing the sampling logic and bumping `WORKLIST_LOGIC_VERSION`, is sufficient; you
+don't need to remember `--rebuild-worklist`. The manual flag is now only for picking up changed
+*upstream data* under an unchanged config (new panoramas published, or a refreshed boundary cache),
+which the stamp cannot detect; the "loading cached work list" message says so each run. Re-running
+with unchanged settings reuses the cached list. Re-thinning
 never re-downloads existing points: completed `pano_id`s are skipped via the manifest, and any
 panorama whose four crops are already on disk is skipped too — only the newly-introduced points are
 fetched.

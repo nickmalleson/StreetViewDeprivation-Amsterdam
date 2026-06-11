@@ -108,6 +108,16 @@ TARGET_N      = 5000     # approximate total number of points to sample city-wid
 STRATUM_M     = 200.0    # grid cell size the proportional share is applied over
 MIN_SPACING_M = 30.0     # anti-clump floor: drop near-duplicates before sampling; None to disable
 
+# Version of the work-list *construction logic* (the tiling/clipping/thinning code in
+# build_worklist + its helpers), as opposed to the tunable settings above. It is part of
+# the cache stamp, so bumping it forces an automatic rebuild on the next run — exactly as
+# changing a setting does. BUMP THIS whenever you change *how* the work list is built (a
+# bug fix or algorithm tweak), since such changes alter the sample without changing any
+# setting and would otherwise be silently masked by the cached work list.
+#   v1: original.  v2: fixed the _thin_to_target label-indexing bug (was biasing the
+#       whole sample to the west of the city).
+WORKLIST_LOGIC_VERSION = 2
+
 # --- endpoints ---
 PANO_API = "https://api.data.amsterdam.nl/panorama/panoramas/"
 
@@ -294,6 +304,7 @@ def _worklist_settings(dev_bbox):
         "TILE_M": TILE_M,
         "MUNICIPALITY_CODE": MUNICIPALITY_CODE,
         "IMG_VARIANT": IMG_VARIANT,            # the stored image URL depends on this
+        "WORKLIST_LOGIC_VERSION": WORKLIST_LOGIC_VERSION,  # forces a rebuild when the build code changes
         "dev_bbox": list(dev_bbox) if dev_bbox else None,
     }
 
@@ -322,6 +333,11 @@ def build_worklist(session, dev_bbox=None, force=False):
                 cached = json.load(f)
         if cached == current:
             print(f"Work list exists and matches current settings — loading {WORKLIST_PATH}")
+            print("    (Settings and build-logic version are unchanged, so the cache is reused.")
+            print("     This is NOT re-checked against the live panorama API or the boundary")
+            print("     cache. If the upstream data has changed — new panoramas published, or")
+            print("     you refreshed the boundary with get_amsterdam_buurten(force=True) — and")
+            print("     you want those reflected, force a fresh build with: --rebuild-worklist)")
             return pd.read_parquet(WORKLIST_PATH)
         # Settings changed (or no stamp) -> rebuild and say why.
         if cached is None:
@@ -640,7 +656,11 @@ def main(argv=None):
     ap.add_argument("--limit", type=int, default=None,
                     help="download at most this many new points (for testing)")
     ap.add_argument("--rebuild-worklist", action="store_true",
-                    help="rebuild the work list even if cached")
+                    help="force a rebuild of the work list even if the cache looks current. "
+                         "Settings and build-logic changes already trigger a rebuild "
+                         "automatically; use this only to pick up changed UPSTREAM DATA under "
+                         "an unchanged config (new panoramas published, or a refreshed boundary "
+                         "cache), which the cache stamp cannot detect.")
     ap.add_argument("--worklist-only", action="store_true",
                     help="build the work list and stop")
     ap.add_argument("--build-h5", action="store_true",
