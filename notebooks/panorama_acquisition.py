@@ -610,7 +610,29 @@ def build_h5(worklist, out_path=h5_filename):
 # =============================================================================
 # CLI
 # =============================================================================
+def _check_cwd():
+    """Fail fast if run from the wrong directory.
+
+    The data paths in directory_filepaths.py are relative to the current working
+    directory (e.g. raw_dir == "../data/raw"), so they only resolve correctly when
+    the script is run from its own folder (notebooks/). Run from elsewhere — e.g. the
+    project root — "../data" silently points outside the repo, creating a stray data/
+    tree and re-downloading everything. Checked only on direct CLI execution (not on
+    import), so notebook 1's driver use and ad-hoc imports are unaffected.
+    """
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if os.path.realpath(os.getcwd()) != os.path.realpath(script_dir):
+        raise RuntimeError(
+            f"panorama_acquisition.py must be run from its own directory so the "
+            f"'../data' paths resolve correctly.\n"
+            f"    expected working directory: {script_dir}\n"
+            f"    current working directory:  {os.getcwd()}\n"
+            f"Fix: cd into that directory first, e.g.  cd {script_dir}"
+        )
+
+
 def main(argv=None):
+    _check_cwd()
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--bbox", nargs=4, type=float, metavar=("MINLON", "MINLAT", "MAXLON", "MAXLAT"),
