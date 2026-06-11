@@ -258,9 +258,15 @@ def _thin_to_target(gdf_proj, target_n, stratum_m, min_spacing_m=None,
 
     target_n=None keeps everything (subject only to the floor).
     """
-    g = _thin_to_spacing(gdf_proj, min_spacing_m) if min_spacing_m else gdf_proj
+    # The min-spacing floor resets the index, so all label-based selection below must be
+    # against `g` (the floored frame), NOT the original gdf_proj: their labels no longer
+    # correspond. (Selecting from gdf_proj here silently returned the lowest-indexed
+    # original rows — i.e. the points collected first, which, since tiles are queried
+    # west->east, biased the whole sample to the west of the city.)
+    g = (_thin_to_spacing(gdf_proj, min_spacing_m) if min_spacing_m else gdf_proj
+         ).reset_index(drop=True)
     if not target_n or target_n >= len(g):
-        return g.reset_index(drop=True)
+        return g
 
     fraction = target_n / len(g)
     gx = np.floor(g.geometry.x / stratum_m).astype(int)
@@ -274,7 +280,7 @@ def _thin_to_target(gdf_proj, target_n, stratum_m, min_spacing_m=None,
             keep.extend(grp.index)
         else:
             keep.extend(rng.choice(grp.index.to_numpy(), size=n_keep, replace=False))
-    return gdf_proj.loc[keep].reset_index(drop=True)
+    return g.loc[keep].drop(columns="_cell").reset_index(drop=True)
 
 
 def _worklist_settings(dev_bbox):
