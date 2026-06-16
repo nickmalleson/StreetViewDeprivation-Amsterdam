@@ -12,8 +12,9 @@ Pipeline
 --------
 1. build_worklist : query the panorama REST API over a grid of small bbox tiles
                     with `newest_in_range=true` (= most recent mission per
-                    location), clip to the Amsterdam municipality, thin
-                    density-proportionally to ~TARGET_N points, and persist the
+                    location), clip to the Amsterdam municipality (by default only the
+                    buurten that have a CBS SES-WOA score — see RESTRICT_TO_SCORED_BUURTEN),
+                    thin density-proportionally to ~TARGET_N points, and persist the
                     canonical work list.
 2. download_all   : for each work-list point NOT already completed, download the
                     equirectangular image and reproject it into four 90-deg FOV
@@ -64,8 +65,9 @@ from tqdm import tqdm
 
 from directory_filepaths import (
     raw_dir, h5_filename, GEOGRAPHIC_CRS, PROJECTED_CRS, MUNICIPALITY_CODE,
+    JOIN_KEY, CBS_TABLE, CBS_YEAR,
 )
-from amsterdam_data import get_amsterdam_buurten, USER_AGENT
+from amsterdam_data import get_amsterdam_buurten, get_ses_woa, USER_AGENT
 
 # =============================================================================
 # CONSTANTS  (the single, easily-found place to tune behaviour)
@@ -104,9 +106,20 @@ RANDOM_STATE = 42        # seed for the (reproducible) density-proportional samp
 # budget and the per-cell share is derived from it (TARGET_N / available points); the
 # min-one-per-cell rule means the realised count can run slightly above TARGET_N. Set
 # TARGET_N to None to keep every newest-per-location panorama (the full ~1M-point set).
-TARGET_N      = 5000     # approximate total number of points to sample city-wide
+TARGET_N      = 20000     # approximate total number of points to sample city-wide
 STRATUM_M     = 200.0    # grid cell size the proportional share is applied over
 MIN_SPACING_M = 30.0     # anti-clump floor: drop near-duplicates before sampling; None to disable
+
+# Restrict the download to buurten that actually have a CBS SES-WOA score (the model
+# target). Amsterdam's boundary includes ~100 non-residential buurten (ports, industrial
+# estates, parks, rail yards) for which CBS publishes no SES-WOA score, so panoramas there
+# can never form a (target, imagery) training pair. By default we therefore clip the work
+# list to the scored buurten and don't download the rest — fewer wasted fetches, and the
+# analysis is unaffected (the notebooks already drop unscored buurten at the SES merge).
+# Set to False (or pass --all-buurten) to fetch the whole municipality regardless. Because
+# the scored set is defined by the CBS table/year, CBS_TABLE and CBS_YEAR are part of the
+# work-list cache stamp whenever this restriction is on.
+RESTRICT_TO_SCORED_BUURTEN = True
 
 # Version of the work-list *construction logic* (the tiling/clipping/thinning code in
 # build_worklist + its helpers), as opposed to the tunable settings above. It is part of
@@ -115,8 +128,9 @@ MIN_SPACING_M = 30.0     # anti-clump floor: drop near-duplicates before samplin
 # bug fix or algorithm tweak), since such changes alter the sample without changing any
 # setting and would otherwise be silently masked by the cached work list.
 #   v1: original.  v2: fixed the _thin_to_target label-indexing bug (was biasing the
-#       whole sample to the west of the city).
-WORKLIST_LOGIC_VERSION = 2
+#       whole sample to the west of the city).  v3: clip to SES-scored buurten by default
+#       (RESTRICT_TO_SCORED_BUURTEN) instead of the whole municipality.
+WORKLIST_LOGIC_VERSION = 3
 
 # --- endpoints ---
 PANO_API = "https://api.data.amsterdam.nl/panorama/panoramas/"
@@ -293,10 +307,10 @@ def _thin_to_target(gdf_proj, target_n, stratum_m, min_spacing_m=None,
     return g.loc[keep].drop(columns="_cell").reset_index(drop=True)
 
 
-def _worklist_settings(dev_bbox):
+def _worklist_settings(dev_bbox, restrict_to_scored):
     """The settings that determine the work list. If any of these change, the cached
     work list is stale and must be rebuilt (handled automatically in build_worklist)."""
-    return {
+    settings = {
         "TARGET_N": TARGET_N,
         "STRATUM_M": STRATUM_M,
         "MIN_SPACING_M": MIN_SPACING_M,
@@ -306,17 +320,29 @@ def _worklist_settings(dev_bbox):
         "IMG_VARIANT": IMG_VARIANT,            # the stored image URL depends on this
         "WORKLIST_LOGIC_VERSION": WORKLIST_LOGIC_VERSION,  # forces a rebuild when the build code changes
         "dev_bbox": list(dev_bbox) if dev_bbox else None,
+        "RESTRICT_TO_SCORED_BUURTEN": restrict_to_scored,
     }
+    # The scored-buurten set is defined by the CBS SES-WOA table/year, so those become
+    # part of the stamp only when the restriction is active (otherwise they're irrelevant).
+    if restrict_to_scored:
+        settings["CBS_TABLE"] = CBS_TABLE
+        settings["CBS_YEAR"] = CBS_YEAR
+    return settings
 
 
-def build_worklist(session, dev_bbox=None, force=False):
+def build_worklist(session, dev_bbox=None, restrict_to_scored=True, force=False):
     """Build (and cache) the canonical work list of panoramas to download.
 
     The cache is reused only if it was built with the same settings (target size,
-    stratum, spacing floor, seed, tile size, AOI, image variant, dev bbox). If any of
+    stratum, spacing floor, seed, tile size, AOI, image variant, dev bbox, the
+    scored-buurten restriction and — when it is on — the CBS table/year). If any of
     those changed since the cache was written, it is rebuilt automatically — so editing
     e.g. TARGET_N at the top of this file is enough; you do not need to remember
     --rebuild-worklist.
+
+    When restrict_to_scored is True (the default), the clip region is just the buurten
+    that have a CBS SES-WOA score, so panoramas in the ~100 unscored non-residential
+    buurten (ports, industrial estates, parks) are never downloaded.
     """
     vprint("\n" + "-" * 70)
     vprint("STEP 1/3 — build the work list (which panoramas to download)")
@@ -325,7 +351,7 @@ def build_worklist(session, dev_bbox=None, force=False):
     vprint("It is cached to disk and only rebuilt when the settings that define it change,")
     vprint("so this step is usually instant on reruns.")
 
-    current = _worklist_settings(dev_bbox)
+    current = _worklist_settings(dev_bbox, restrict_to_scored)
     if os.path.exists(WORKLIST_PATH) and not force:
         cached = None
         if os.path.exists(WORKLIST_META):
@@ -351,7 +377,21 @@ def build_worklist(session, dev_bbox=None, force=False):
     vprint("Loading the Amsterdam municipality boundary (CBS buurten, EPSG:28992) and")
     vprint("dissolving it into a single polygon to clip panoramas against.")
     buurten = get_amsterdam_buurten()                      # EPSG:28992
-    boundary = buurten.geometry.union_all()                # municipality polygon
+    if restrict_to_scored:
+        # Keep only buurten with a published CBS SES-WOA score (the model target); the
+        # rest are non-residential (ports, industrial estates, parks) and can never
+        # contribute a (target, imagery) training pair, so we don't download them.
+        ses = get_ses_woa()                                # cached CBS OData fetch
+        n_all = len(buurten)
+        buurten = buurten[buurten[JOIN_KEY].isin(ses[JOIN_KEY])].copy()
+        vprint(f"Restricting to the {len(buurten)} buurten with a CBS SES-WOA score "
+               f"(dropped {n_all - len(buurten)} unscored non-residential buurten: ports,")
+        vprint("industrial estates, parks, rail yards). Pass --all-buurten to keep the whole")
+        vprint("municipality. The clip region below is therefore the scored buurten only.")
+    else:
+        vprint("Including the whole municipality (--all-buurten): buurten with no CBS")
+        vprint("SES-WOA score are kept, even though they cannot contribute a training target.")
+    boundary = buurten.geometry.union_all()                # clip polygon (scored buurten, or all)
     boundary_ll = gpd.GeoSeries([boundary], crs=PROJECTED_CRS).to_crs(GEOGRAPHIC_CRS).iloc[0]
 
     if dev_bbox is not None:
@@ -661,6 +701,11 @@ def main(argv=None):
                          "automatically; use this only to pick up changed UPSTREAM DATA under "
                          "an unchanged config (new panoramas published, or a refreshed boundary "
                          "cache), which the cache stamp cannot detect.")
+    ap.add_argument("--all-buurten", action="store_true",
+                    help="download panoramas across the WHOLE municipality, including buurten "
+                         "with no CBS SES-WOA score (ports, industrial estates, parks, rail "
+                         "yards). By default (RESTRICT_TO_SCORED_BUURTEN) only scored buurten "
+                         "are fetched, since unscored ones cannot contribute a training target.")
     ap.add_argument("--worklist-only", action="store_true",
                     help="build the work list and stop")
     ap.add_argument("--build-h5", action="store_true",
@@ -692,7 +737,10 @@ def main(argv=None):
         build_h5(worklist)
         return
 
+    # Default to scored-buurten only (the constant); --all-buurten overrides it for this run.
+    restrict_to_scored = RESTRICT_TO_SCORED_BUURTEN and not args.all_buurten
     worklist = build_worklist(session, dev_bbox=tuple(args.bbox) if args.bbox else None,
+                              restrict_to_scored=restrict_to_scored,
                               force=args.rebuild_worklist)
     if args.worklist_only:
         vprint("\n--worklist-only: stopping after the work list (no downloads, no H5).")

@@ -42,9 +42,15 @@ embedding_rgb_pca_file = os.path.join(data_dir, "embedding_rgb_pca.joblib")
 # ---------------------------------------------------------------------------
 # Amsterdam-specific settings (centralised so the city difference lives here)
 # ---------------------------------------------------------------------------
-# CBS municipality code for Amsterdam (gemeente). Used to restrict imagery,
-# boundaries and the SES-WOA target to the Amsterdam municipality only
-# (not Amstelveen, Almere or the wider region).
+# CBS municipality code for Amsterdam (gemeente). This is a deliberate *scoping
+# choice*, not a data limitation: it restricts the boundaries, the SES-WOA target
+# and the imagery work list to the Amsterdam municipality. The open panorama source
+# itself is NOT confined to Amsterdam — it also covers neighbouring regional
+# municipalities (verified: Amstelveen, Almere and Diemen all return panoramas),
+# though not separate cities such as Utrecht or Haarlem. The study could therefore
+# be broadened to those municipalities (which also have CBS SES-WOA scores) by
+# widening this to a set of municipality codes here and in the SES filter, the
+# boundary fetch and the work-list clip.
 MUNICIPALITY_CODE = "0363"
 
 # Projected CRS for all spatial operations in metres: Amersfoort / RD New,
