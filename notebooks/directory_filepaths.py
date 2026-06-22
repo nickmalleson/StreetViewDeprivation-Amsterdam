@@ -42,16 +42,19 @@ embedding_rgb_pca_file = os.path.join(data_dir, "embedding_rgb_pca.joblib")
 # ---------------------------------------------------------------------------
 # Amsterdam-specific settings (centralised so the city difference lives here)
 # ---------------------------------------------------------------------------
-# CBS municipality code for Amsterdam (gemeente). This is a deliberate *scoping
-# choice*, not a data limitation: it restricts the boundaries, the SES-WOA target
-# and the imagery work list to the Amsterdam municipality. The open panorama source
-# itself is NOT confined to Amsterdam — it also covers neighbouring regional
-# municipalities (verified: Amstelveen, Almere and Diemen all return panoramas),
-# though not separate cities such as Utrecht or Haarlem. The study could therefore
-# be broadened to those municipalities (which also have CBS SES-WOA scores) by
-# widening this to a set of municipality codes here and in the SES filter, the
-# boundary fetch and the work-list clip.
-MUNICIPALITY_CODE = "0363"
+# CBS municipality codes (gemeente) that define the study region. This is a deliberate
+# *scoping choice*, not a data limitation: it restricts the boundaries, the SES-WOA
+# target and the imagery work list to these municipalities. The open panorama source is
+# NOT confined to Amsterdam — it also covers neighbouring regional municipalities (each
+# of which has a national CBS SES-WOA score), though not separate cities such as Utrecht
+# or Haarlem. The study region is therefore the set below; broadening or narrowing it is
+# a matter of editing this list (it drives the SES filter, the boundary fetch and the
+# work-list clip — see amsterdam_data.py and panorama_acquisition.py). Codes verified
+# against CBS table 86092NED and the PDOK WijkBuurtkaart 2024:
+#   0363 Amsterdam  ·  0362 Amstelveen  ·  0384 Diemen  ·  0034 Almere
+# Amsterdam is listed first by convention; the order does not affect results (each
+# municipality is sampled independently — see TARGET_N in panorama_acquisition.py).
+MUNICIPALITY_CODES = ["0363", "0362", "0384", "0034"]
 
 # Projected CRS for all spatial operations in metres: Amersfoort / RD New,
 # the standard projected CRS for the Netherlands.

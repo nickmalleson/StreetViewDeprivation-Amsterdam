@@ -10,12 +10,15 @@ api.data.amsterdam.nl.
 
 Pipeline
 --------
-1. build_worklist : query the panorama REST API over a grid of small bbox tiles
-                    with `newest_in_range=true` (= most recent mission per
-                    location), clip to the Amsterdam municipality (by default only the
-                    buurten that have a CBS SES-WOA score — see RESTRICT_TO_SCORED_BUURTEN),
-                    thin density-proportionally to ~TARGET_N points, and persist the
-                    canonical work list.
+1. build_worklist : for each gemeente in MUNICIPALITY_CODES, query the panorama REST
+                    API over a grid of small bbox tiles with `newest_in_range=true`
+                    (= most recent mission per location; where that mission's imagery has
+                    been withdrawn it falls back to the newest mission still on the server —
+                    see UNAVAILABLE_MISSION_YEARS) and clip to that municipality (by
+                    default only the buurten that have a CBS SES-WOA score — see
+                    RESTRICT_TO_SCORED_BUURTEN); then pool all municipalities and thin
+                    density-proportionally to ~TARGET_N points REGION-WIDE with a
+                    MIN_PER_BUURT floor, and persist the canonical work list.
 2. download_all   : for each work-list point NOT already completed, download the
                     equirectangular image and reproject it into four 90-deg FOV
                     rectilinear crops (headings 0/90/180/270 = N/E/S/W). Crops are
@@ -39,7 +42,7 @@ Typical use
 -----------
   # small bounding box for development (lon/lat order):
   python panorama_acquisition.py --bbox 4.890 52.368 4.900 52.374
-  # whole municipality (safe to Ctrl-C and rerun until complete):
+  # whole study region — every gemeente in MUNICIPALITY_CODES (safe to Ctrl-C and rerun):
   python panorama_acquisition.py
 """
 
@@ -64,7 +67,7 @@ import py360convert
 from tqdm import tqdm
 
 from directory_filepaths import (
-    raw_dir, h5_filename, GEOGRAPHIC_CRS, PROJECTED_CRS, MUNICIPALITY_CODE,
+    raw_dir, h5_filename, GEOGRAPHIC_CRS, PROJECTED_CRS, MUNICIPALITY_CODES,
     JOIN_KEY, CBS_TABLE, CBS_YEAR,
 )
 from amsterdam_data import get_amsterdam_buurten, get_ses_woa, USER_AGENT
@@ -96,19 +99,42 @@ TILE_M = 480.0           # bbox tile size in metres; <0.25 km^2 cap for newest_i
 RANDOM_STATE = 42        # seed for the (reproducible) density-proportional sampling
 
 # Density-proportional thinning of the (very dense) panorama points.
-# Amsterdam's open panoramas sit every few metres (~1M points for the municipality),
-# which is impractical to download in full and far finer than the neighbourhood scale of
-# the analysis. Rather than an even spatial grid (constant points per km^2, which under-
+# The open panoramas sit every few metres (~1M points for Amsterdam alone), which is
+# impractical to download in full and far finer than the neighbourhood scale of the
+# analysis. Rather than an even spatial grid (constant points per km^2, which under-
 # samples densely-roaded areas), we keep a fixed *share* of the panoramas within each
 # STRATUM_M grid cell. Because panoramas trace the road network, this makes the sample
 # density track local road density -- denser, more built-up areas get proportionally more
-# points -- while every populated cell keeps at least one. TARGET_N sets the overall
-# budget and the per-cell share is derived from it (TARGET_N / available points); the
-# min-one-per-cell rule means the realised count can run slightly above TARGET_N. Set
-# TARGET_N to None to keep every newest-per-location panorama (the full ~1M-point set).
-TARGET_N      = 20000     # approximate total number of points to sample city-wide
+# points -- while every populated cell keeps at least one. The per-cell share is derived
+# from TARGET_N (TARGET_N / available points); the min-one-per-cell rule means the
+# realised count can run above TARGET_N. Set TARGET_N to None to keep every
+# newest-per-location panorama (the full set).
+#
+# TARGET_N is a SINGLE REGION-WIDE budget: all gemeenten in MUNICIPALITY_CODES are pooled
+# and thinned together against one global per-cell share (TARGET_N / total available
+# across the whole region). This gives every municipality the SAME sampling density (the
+# share of panoramas kept per cell is identical everywhere), so no municipality is sampled
+# more heavily per km^2 than another — unlike a per-municipality budget, which would pack
+# TARGET_N points into a small gemeente and spread the same count thinly over a large one.
+# The trade-off: because the global share depends on the region-wide total, adding or
+# removing a municipality re-thins the WHOLE region, so an existing municipality's selected
+# points (and hence which crops are needed) can change — re-running the downloader then
+# fetches the newly-selected points and simply leaves the now-deselected ones unused on
+# disk. The min-per-buurt top-up below is purely additive on top.
+TARGET_N      = 50000   # approximate TOTAL number of points to sample across the whole region
 STRATUM_M     = 200.0    # grid cell size the proportional share is applied over
 MIN_SPACING_M = 30.0     # anti-clump floor: drop near-duplicates before sampling; None to disable
+
+# Guaranteed minimum panoramas per scored buurt. The density-proportional sample alone
+# can leave small / low-road-density buurten with only a handful of points (sometimes
+# 1-2), giving a noisy per-buurt median embedding and large model residuals. After the
+# density sample, any scored buurt holding fewer than MIN_PER_BUURT selected panoramas is
+# topped up from its remaining available panoramas (those that survived the MIN_SPACING_M
+# floor but were not picked), up to MIN_PER_BUURT or as many as the buurt actually has.
+# The top-up is ADDITIVE — it only ever adds points to the density sample, never removes
+# them — so the selection stays a superset and previously-downloaded points are retained.
+# Set to None to disable (revert to density-proportional sampling only).
+MIN_PER_BUURT = 10
 
 # Restrict the download to buurten that actually have a CBS SES-WOA score (the model
 # target). Amsterdam's boundary includes ~100 non-residential buurten (ports, industrial
@@ -121,6 +147,26 @@ MIN_SPACING_M = 30.0     # anti-clump floor: drop near-duplicates before samplin
 # work-list cache stamp whenever this restriction is on.
 RESTRICT_TO_SCORED_BUURTEN = True
 
+# Mission years whose imagery has been WITHDRAWN from the City-of-Amsterdam storage server
+# (t1.data.amsterdam.nl) even though the API still lists the panorama records. Observed
+# 2026-06: the entire 2023 campaign (Apr-Jun) returns HTTP 404 "blob does not exist" at every
+# resolution (full/medium/small and the cubic preview). Because the API's newest_in_range=true
+# returns the *newest* mission per location, any location whose newest mission is one of these
+# years would yield a dead record with no downloadable image. 2023 is the newest mission across
+# Almere (but not Amsterdam/Amstelveen/Diemen, whose newest is 2024/2025), so left unhandled it
+# costs ~72% of Almere's coverage. _query_tile therefore detects this and falls back to the
+# newest mission that STILL has imagery (typically 2017-2020 for Almere). Set to an empty set to
+# disable the fallback (e.g. if the city later restores the 2023 blobs); add a year if a future
+# campaign is likewise withdrawn. NB: this mixes image years (recovered Almere is 2017-2020 vs
+# Amsterdam 2025) — a deliberate, documented trade-off to regain coverage.
+UNAVAILABLE_MISSION_YEARS = {2023}
+
+# Grid cell (projected metres) used by the withdrawn-imagery fallback to reduce the all-missions
+# query back to ~one newest-available panorama per location, approximating newest_in_range's
+# density before the usual MIN_SPACING_M / density thinning runs. A few metres matches the
+# panorama spacing along the road; it only affects tiles that actually trigger the fallback.
+FALLBACK_CELL_M = 5.0
+
 # Version of the work-list *construction logic* (the tiling/clipping/thinning code in
 # build_worklist + its helpers), as opposed to the tunable settings above. It is part of
 # the cache stamp, so bumping it forces an automatic rebuild on the next run — exactly as
@@ -129,8 +175,16 @@ RESTRICT_TO_SCORED_BUURTEN = True
 # setting and would otherwise be silently masked by the cached work list.
 #   v1: original.  v2: fixed the _thin_to_target label-indexing bug (was biasing the
 #       whole sample to the west of the city).  v3: clip to SES-scored buurten by default
-#       (RESTRICT_TO_SCORED_BUURTEN) instead of the whole municipality.
-WORKLIST_LOGIC_VERSION = 3
+#       (RESTRICT_TO_SCORED_BUURTEN) instead of the whole municipality.  v4: multi-
+#       municipality study region (MUNICIPALITY_CODES) sampled per-municipality so each
+#       gemeente gets its own ~TARGET_N budget; plus an additive MIN_PER_BUURT floor.
+#       v5: TARGET_N is now a single region-wide total — all municipalities are pooled and
+#       thinned together against one global per-cell share, so sampling density is uniform
+#       across the region (no per-municipality budget).  v6: withdrawn-imagery fallback —
+#       _query_tile re-queries all missions and keeps the newest mission with intact imagery
+#       where the newest_in_range result is a withdrawn year (UNAVAILABLE_MISSION_YEARS),
+#       recovering Almere from 2017-2020 imagery instead of the dead 2023 records.
+WORKLIST_LOGIC_VERSION = 6
 
 # --- endpoints ---
 PANO_API = "https://api.data.amsterdam.nl/panorama/panoramas/"
@@ -231,13 +285,22 @@ def _tiles_over_bounds(bounds_proj, tile_m):
                    min(maxx, minx + (ix + 1) * tile_m), min(maxy, miny + (iy + 1) * tile_m))
 
 
-def _query_tile(session, bbox_latlon):
-    """Return list of newest-in-range panoramas for one (minlon,minlat,maxlon,maxlat) bbox."""
+def _api_panoramas(session, bbox_latlon, newest_in_range):
+    """Return panorama records for one (minlon,minlat,maxlon,maxlat) bbox (paginated).
+
+    newest_in_range=True  -> one panorama per location (its most recent mission); the cheap
+                             default used everywhere the newest imagery is intact.
+    newest_in_range=False -> every mission's panorama in the bbox (many per location); used
+                             only by the withdrawn-imagery fallback in _query_tile, since it
+                             returns far more records.
+    """
     min_lon, min_lat, max_lon, max_lat = bbox_latlon
     params = {
         "bbox": f"{min_lon},{min_lat},{max_lon},{max_lat}",
-        "srid": "4326", "newest_in_range": "true", "page_size": "2000",
+        "srid": "4326", "page_size": "2000",
     }
+    if newest_in_range:
+        params["newest_in_range"] = "true"
     out, url = [], PANO_API
     while url:
         resp = request_with_backoff(session, url, params=params)
@@ -258,6 +321,43 @@ def _query_tile(session, bbox_latlon):
     return out
 
 
+def _newest_available_per_cell(recs, cell_m=FALLBACK_CELL_M):
+    """Reduce all-missions records to ~one panorama per location: drop UNAVAILABLE_MISSION_YEARS
+    and, within each ~cell_m projected grid cell, keep the newest remaining panorama. This is the
+    'newest mission whose imagery still exists' at roughly the per-location density that
+    newest_in_range would have produced (the later MIN_SPACING_M / density thinning takes over
+    from there)."""
+    avail = [r for r in recs if r["mission_year"] not in UNAVAILABLE_MISSION_YEARS]
+    if not avail:
+        return []
+    proj = gpd.GeoSeries(gpd.points_from_xy([r["lon"] for r in avail], [r["lat"] for r in avail]),
+                         crs=GEOGRAPHIC_CRS).to_crs(PROJECTED_CRS)
+    best = {}
+    for r, geom in zip(avail, proj):
+        cell = (int(geom.x // cell_m), int(geom.y // cell_m))
+        cur = best.get(cell)
+        if cur is None or r["timestamp"] > cur["timestamp"]:   # same ISO format -> lexical == chronological
+            best[cell] = r
+    return list(best.values())
+
+
+def _query_tile(session, bbox_latlon):
+    """Newest-per-location panoramas for one bbox, resilient to withdrawn imagery.
+
+    Normally this is just the API's newest_in_range result (one current panorama per location).
+    But where the newest mission's imagery has been withdrawn from storage — its mission_year is
+    in UNAVAILABLE_MISSION_YEARS (the whole 2023 campaign, which 404s at every resolution and is
+    the newest mission across Almere) — that result would be dead records with no downloadable
+    image. In that case we re-query the tile for ALL missions and keep, per location, the newest
+    mission that still HAS imagery (typically 2017-2020 for Almere). Tiles whose newest imagery is
+    intact (Amsterdam/Amstelveen/Diemen, newest = 2024/2025) never pay this second query.
+    """
+    recs = _api_panoramas(session, bbox_latlon, newest_in_range=True)
+    if UNAVAILABLE_MISSION_YEARS and any(r["mission_year"] in UNAVAILABLE_MISSION_YEARS for r in recs):
+        recs = _newest_available_per_cell(_api_panoramas(session, bbox_latlon, newest_in_range=False))
+    return recs
+
+
 def _thin_to_spacing(gdf_proj, spacing_m):
     """Keep at most one point per spacing_m grid cell (the one nearest the cell centre)."""
     gx = np.floor(gdf_proj.geometry.x / spacing_m).astype(int)
@@ -270,9 +370,23 @@ def _thin_to_spacing(gdf_proj, spacing_m):
     return gdf_proj.loc[keep].reset_index(drop=True)
 
 
+def _assign_buurt(g_proj, buurten_proj):
+    """Spatially assign each point in g_proj to a buurt (its JOIN_KEY) by point-in-polygon.
+
+    Returns a Series of buurtcode indexed like g_proj (NaN for any point that falls
+    outside every buurt). A point landing exactly on a shared boundary can match more
+    than one buurt; we keep the first match, which is sufficient for the per-buurt count.
+    Both frames must be in the same projected CRS.
+    """
+    joined = gpd.sjoin(g_proj[["geometry"]], buurten_proj[[JOIN_KEY, "geometry"]],
+                       how="left", predicate="within")
+    joined = joined[~joined.index.duplicated(keep="first")]
+    return joined[JOIN_KEY].reindex(g_proj.index)
+
+
 def _thin_to_target(gdf_proj, target_n, stratum_m, min_spacing_m=None,
-                    random_state=RANDOM_STATE):
-    """Density-proportional thinning to ~target_n points.
+                    random_state=RANDOM_STATE, buurten_proj=None, min_per_buurt=None):
+    """Density-proportional thinning to ~target_n points, with an optional per-buurt floor.
 
     Keep a fixed share of the panoramas within every stratum_m grid cell, so denser
     areas (more road, hence more panoramas) keep proportionally more points while every
@@ -280,7 +394,14 @@ def _thin_to_target(gdf_proj, target_n, stratum_m, min_spacing_m=None,
     the optional min_spacing_m floor); the min-one-per-cell rule means the realised
     count can run a little above target_n where many cells are sparse.
 
-    target_n=None keeps everything (subject only to the floor).
+    If min_per_buurt and buurten_proj are given, the density sample is then topped up:
+    any buurt holding fewer than min_per_buurt selected points gains extra points drawn
+    (reproducibly) from its own remaining available points, up to min_per_buurt or as
+    many as the buurt has. This step is purely ADDITIVE — it never drops a point the
+    density sample chose — so the result stays a superset of the density-only selection.
+
+    target_n=None keeps everything (subject only to the floor); the per-buurt top-up is
+    then a no-op because nothing was thinned away.
     """
     # The min-spacing floor resets the index, so all label-based selection below must be
     # against `g` (the floored frame), NOT the original gdf_proj: their labels no longer
@@ -304,7 +425,86 @@ def _thin_to_target(gdf_proj, target_n, stratum_m, min_spacing_m=None,
             keep.extend(grp.index)
         else:
             keep.extend(rng.choice(grp.index.to_numpy(), size=n_keep, replace=False))
-    return g.loc[keep].drop(columns="_cell").reset_index(drop=True)
+
+    # Additive per-buurt floor: top up under-represented buurten from their own leftovers.
+    keep = set(int(i) for i in keep)
+    if min_per_buurt and buurten_proj is not None and len(buurten_proj):
+        codes = _assign_buurt(g, buurten_proj)
+        info = pd.DataFrame({"_code": codes.to_numpy()}, index=g.index)
+        info["_sel"] = info.index.isin(keep)
+        for _, grp in info.dropna(subset=["_code"]).groupby("_code", sort=False):
+            n_sel = int(grp["_sel"].sum())
+            if n_sel >= min_per_buurt:
+                continue
+            avail = grp.index[~grp["_sel"]].to_numpy()
+            need = min(min_per_buurt - n_sel, len(avail))
+            if need > 0:
+                keep.update(int(i) for i in rng.choice(avail, size=need, replace=False))
+
+    return g.loc[sorted(keep)].drop(columns="_cell").reset_index(drop=True)
+
+
+def _query_municipality_points(session, buurten_sub, label, dev_bbox):
+    """Query + clip the panoramas for a SINGLE municipality — NO thinning.
+
+    Queries the panorama API tile-by-tile over this municipality's bounds and clips
+    precisely to its (scored) buurten, returning every newest-per-location panorama inside
+    the area as a GeoDataFrame in the geographic CRS — or an empty frame if the municipality
+    has no points in scope (e.g. it lies outside a dev bbox).
+
+    Thinning to the ~TARGET_N budget is deliberately NOT done here: all municipalities are
+    pooled and thinned together once, in build_worklist, against a single global per-cell
+    share. That is what makes the sampling density uniform across the whole region rather
+    than packing ~TARGET_N points into each gemeente regardless of its size.
+    """
+    boundary = buurten_sub.geometry.union_all()            # projected (EPSG:28992)
+    boundary_ll = gpd.GeoSeries([boundary], crs=PROJECTED_CRS).to_crs(GEOGRAPHIC_CRS).iloc[0]
+
+    if dev_bbox is not None:
+        # dev_bbox is (minlon, minlat, maxlon, maxlat); intersect with this municipality.
+        region_proj = (gpd.GeoSeries([box(*dev_bbox)], crs=GEOGRAPHIC_CRS)
+                       .to_crs(PROJECTED_CRS).iloc[0]).intersection(boundary)
+        clip_geom = boundary_ll.intersection(box(*dev_bbox))
+        if region_proj.is_empty:
+            vprint(f"  [{label}] outside the dev bbox — skipped.")
+            return gpd.GeoDataFrame(columns=["pano_id"], geometry=[], crs=GEOGRAPHIC_CRS)
+    else:
+        region_proj = boundary
+        clip_geom = boundary_ll
+
+    # Tiles cover the *rectangle* of the region's bounds, but each municipality's outline is
+    # irregular and water-laced, so much of that rectangle is open water or other gemeenten.
+    # Skip any tile that doesn't intersect the (land-only) boundary before querying it — the
+    # per-point clip below still runs, so this only avoids wasted API calls.
+    region_prep = prep(region_proj)
+    all_tiles = list(_tiles_over_bounds(region_proj.bounds, TILE_M))
+    tiles = [t for t in all_tiles if region_prep.intersects(box(*t))]
+    print(f"  [{label}] querying {len(tiles)} tiles of {TILE_M:.0f} m "
+          f"(skipped {len(all_tiles) - len(tiles)} empty tiles).")
+
+    records, seen = [], set()
+    for t in tqdm(tiles, desc=f"{label} tiles", unit="tile"):
+        bbox_ll = (gpd.GeoSeries([box(*t)], crs=PROJECTED_CRS)
+                   .to_crs(GEOGRAPHIC_CRS).iloc[0].bounds)  # (minlon,minlat,maxlon,maxlat)
+        for rec in _query_tile(session, bbox_ll):
+            if rec["pano_id"] not in seen:
+                seen.add(rec["pano_id"])
+                records.append(rec)
+
+    if not records:
+        print(f"  [{label}] no panoramas returned.")
+        return gpd.GeoDataFrame(columns=["pano_id"], geometry=[], crs=GEOGRAPHIC_CRS)
+
+    df = pd.DataFrame.from_records(records)
+    gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.lon, df.lat),
+                           crs=GEOGRAPHIC_CRS)
+
+    # Clip precisely to the municipality (tiles overlap the bbox, not the polygon).
+    prepared = prep(clip_geom)
+    gdf = gdf[gdf.geometry.apply(prepared.covers)].reset_index(drop=True)
+    vprint(f"  [{label}] {len(gdf)} newest-per-location panoramas inside the area "
+           f"(thinning is done once, region-wide, after all municipalities are pooled).")
+    return gdf
 
 
 def _worklist_settings(dev_bbox, restrict_to_scored):
@@ -314,10 +514,13 @@ def _worklist_settings(dev_bbox, restrict_to_scored):
         "TARGET_N": TARGET_N,
         "STRATUM_M": STRATUM_M,
         "MIN_SPACING_M": MIN_SPACING_M,
+        "MIN_PER_BUURT": MIN_PER_BUURT,
         "RANDOM_STATE": RANDOM_STATE,
         "TILE_M": TILE_M,
-        "MUNICIPALITY_CODE": MUNICIPALITY_CODE,
+        "MUNICIPALITY_CODES": sorted(MUNICIPALITY_CODES),  # study-region gemeente set (order-independent)
         "IMG_VARIANT": IMG_VARIANT,            # the stored image URL depends on this
+        "UNAVAILABLE_MISSION_YEARS": sorted(UNAVAILABLE_MISSION_YEARS),  # withdrawn-imagery fallback set
+        "FALLBACK_CELL_M": FALLBACK_CELL_M,    # density grid for that fallback
         "WORKLIST_LOGIC_VERSION": WORKLIST_LOGIC_VERSION,  # forces a rebuild when the build code changes
         "dev_bbox": list(dev_bbox) if dev_bbox else None,
         "RESTRICT_TO_SCORED_BUURTEN": restrict_to_scored,
@@ -341,8 +544,12 @@ def build_worklist(session, dev_bbox=None, restrict_to_scored=True, force=False)
     --rebuild-worklist.
 
     When restrict_to_scored is True (the default), the clip region is just the buurten
-    that have a CBS SES-WOA score, so panoramas in the ~100 unscored non-residential
-    buurten (ports, industrial estates, parks) are never downloaded.
+    that have a CBS SES-WOA score, so panoramas in the unscored non-residential buurten
+    (ports, industrial estates, parks, rail yards) are never downloaded.
+
+    Each gemeente in MUNICIPALITY_CODES is queried and clipped independently, then the
+    per-municipality point sets are pooled and thinned together ONCE against a single
+    region-wide TARGET_N budget — so sampling density is uniform across the region.
     """
     vprint("\n" + "-" * 70)
     vprint("STEP 1/3 — build the work list (which panoramas to download)")
@@ -374,9 +581,9 @@ def build_worklist(session, dev_bbox=None, restrict_to_scored=True, force=False)
             for k, (old, new) in changed.items():
                 print(f"    {k}: {old} -> {new}")
 
-    vprint("Loading the Amsterdam municipality boundary (CBS buurten, EPSG:28992) and")
-    vprint("dissolving it into a single polygon to clip panoramas against.")
-    buurten = get_amsterdam_buurten()                      # EPSG:28992
+    vprint("Loading the study-region boundary (CBS buurten, EPSG:28992) for every gemeente")
+    vprint("in MUNICIPALITY_CODES, to clip panoramas against.")
+    buurten = get_amsterdam_buurten()                      # EPSG:28992, possibly several gemeenten
     if restrict_to_scored:
         # Keep only buurten with a published CBS SES-WOA score (the model target); the
         # rest are non-residential (ports, industrial estates, parks) and can never
@@ -387,86 +594,55 @@ def build_worklist(session, dev_bbox=None, restrict_to_scored=True, force=False)
         vprint(f"Restricting to the {len(buurten)} buurten with a CBS SES-WOA score "
                f"(dropped {n_all - len(buurten)} unscored non-residential buurten: ports,")
         vprint("industrial estates, parks, rail yards). Pass --all-buurten to keep the whole")
-        vprint("municipality. The clip region below is therefore the scored buurten only.")
+        vprint("region. The clip region below is therefore the scored buurten only.")
     else:
-        vprint("Including the whole municipality (--all-buurten): buurten with no CBS")
-        vprint("SES-WOA score are kept, even though they cannot contribute a training target.")
-    boundary = buurten.geometry.union_all()                # clip polygon (scored buurten, or all)
-    boundary_ll = gpd.GeoSeries([boundary], crs=PROJECTED_CRS).to_crs(GEOGRAPHIC_CRS).iloc[0]
+        vprint("Including the whole region (--all-buurten): buurten with no CBS SES-WOA")
+        vprint("score are kept, even though they cannot contribute a training target.")
 
     if dev_bbox is not None:
-        vprint(f"Dev mode: restricting to bbox {dev_bbox} (lon/lat), intersected with the")
+        vprint(f"Dev mode: restricting to bbox {dev_bbox} (lon/lat), intersected with each")
         vprint("municipality — a small area for quick end-to-end testing.")
     else:
-        vprint("Whole-municipality run: no --bbox given, so the full city is in scope.")
+        vprint("Whole-region run: no --bbox given, so every municipality is in full scope.")
 
-    if dev_bbox is not None:
-        # dev_bbox is (minlon, minlat, maxlon, maxlat); intersect with municipality
-        region_proj = (gpd.GeoSeries([box(*dev_bbox)], crs=GEOGRAPHIC_CRS)
-                       .to_crs(PROJECTED_CRS).iloc[0]).intersection(boundary)
-        clip_geom = boundary_ll.intersection(box(*dev_bbox))
+    # Query each municipality separately (the API caps each 'newest_in_range' query at
+    # 0.25 km^2, so each gemeente is covered by a grid of TILE_M tiles), but DON'T thin per
+    # municipality — pool everything and thin once below, so the per-cell sampling share
+    # (hence density) is identical across the whole region rather than per gemeente.
+    vprint("The panorama API caps each 'newest_in_range' query at 0.25 km^2, so each")
+    vprint(f"municipality is covered by a grid of {TILE_M:.0f} m tiles and queried tile by tile,")
+    vprint("asking for the newest mission per location (one current panorama per spot).")
+    gm_labels = {f"GM{c}": c for c in MUNICIPALITY_CODES}   # GM-code -> bare code for labelling
+    parts = []
+    for gm_code in sorted(buurten["gemeentecode"].unique()):
+        sub = buurten[buurten["gemeentecode"] == gm_code].copy()
+        label = gm_labels.get(gm_code, gm_code)
+        vprint(f"\nMunicipality {gm_code} ({label}): {len(sub)} buurten in scope.")
+        part = _query_municipality_points(session, sub, label, dev_bbox)
+        if len(part):
+            parts.append(part)
+
+    if parts:
+        gdf = pd.concat(parts, ignore_index=True)
+        # A panorama near a shared municipal boundary can be returned for two adjacent
+        # gemeenten; keep the first occurrence so pano_id stays unique across the region.
+        gdf = gdf.drop_duplicates("pano_id").reset_index(drop=True)
     else:
-        region_proj = boundary
-        clip_geom = boundary_ll
+        gdf = gpd.GeoDataFrame(columns=["pano_id"], geometry=[], crs=GEOGRAPHIC_CRS)
+    print(f"Collected {len(gdf)} newest-per-location panoramas across {len(parts)} "
+          f"municipalit{'y' if len(parts) == 1 else 'ies'} (before thinning).")
 
-    # Tiles cover the *rectangle* of the region's bounds, but Amsterdam's outline is
-    # irregular and water-laced, so much of that rectangle is open water or neighbouring
-    # municipalities. Skip any tile that doesn't actually intersect the (land-only)
-    # boundary before querying it — the per-point clip below still runs, so this only
-    # avoids wasted API calls, it never changes the result.
-    vprint(f"The panorama API caps each 'newest_in_range' query at 0.25 km^2, so the area")
-    vprint(f"is covered by a grid of {TILE_M:.0f} m tiles and queried tile by tile. Each query")
-    vprint("asks for the newest mission per location, so we get one current panorama per spot.")
-    region_prep = prep(region_proj)
-    all_tiles = list(_tiles_over_bounds(region_proj.bounds, TILE_M))
-    tiles = [t for t in all_tiles if region_prep.intersects(box(*t))]
-    vprint(f"The bounding rectangle gives {len(all_tiles)} tiles, but Amsterdam's outline is")
-    vprint("irregular and water-laced; tiles not touching land are dropped to avoid wasted")
-    vprint("API calls (this never changes the result — points are clipped precisely below).")
-    print(f"Querying {len(tiles)} tiles of {TILE_M:.0f} m "
-          f"(skipped {len(all_tiles) - len(tiles)} empty tiles outside the municipality).")
-
-    records, seen = [], set()
-    for t in tqdm(tiles, desc="worklist tiles", unit="tile"):
-        bbox_ll = (gpd.GeoSeries([box(*t)], crs=PROJECTED_CRS)
-                   .to_crs(GEOGRAPHIC_CRS).iloc[0].bounds)  # (minlon,minlat,maxlon,maxlat)
-        for rec in _query_tile(session, bbox_ll):
-            if rec["pano_id"] not in seen:
-                seen.add(rec["pano_id"])
-                records.append(rec)
-
-    vprint(f"Collected {len(records)} unique panoramas across all tiles (deduplicated by")
-    vprint("pano_id, since tiles can return the same point near their shared edges).")
-    df = pd.DataFrame.from_records(records)
-    gdf = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.lon, df.lat),
-                           crs=GEOGRAPHIC_CRS)
-
-    # Clip precisely to the municipality (tiles overlap the bbox, not the polygon).
-    vprint("Clipping points to the exact municipality polygon (tiles are rectangular, the")
-    vprint("city is not), so panoramas in water or neighbouring municipalities are dropped.")
-    prepared = prep(clip_geom)
-    gdf = gdf[gdf.geometry.apply(prepared.covers)].reset_index(drop=True)
-    print(f"{len(gdf)} newest-per-location panoramas inside the area.")
-
-    if TARGET_N or MIN_SPACING_M:
-        vprint("")
-        vprint("Thinning the points. Amsterdam's panoramas sit every few metres (~1M city-")
-        vprint("wide) — far finer than the neighbourhood scale of the analysis and too many")
-        vprint("to download. Two passes reduce them sensibly:")
-        if MIN_SPACING_M:
-            vprint(f"  (a) anti-clump floor: drop near-duplicates closer than {MIN_SPACING_M:.0f} m,")
-            vprint("      keeping the one nearest each grid-cell centre.")
-        if TARGET_N:
-            vprint(f"  (b) density-proportional sample to ~{TARGET_N} points: keep a fixed *share*")
-            vprint(f"      of the points in every {STRATUM_M:.0f} m cell, so denser (more-roaded,")
-            vprint("      more built-up) areas keep proportionally more points, while every")
-            vprint(f"      populated cell keeps at least one (seed RANDOM_STATE={RANDOM_STATE}).")
+    # Thin ONCE over the pooled region, so the per-cell sampling share (hence density) is
+    # the same everywhere — TARGET_N is a single region-wide budget, not per municipality.
+    # The MIN_PER_BUURT floor is applied globally against the full (scored) buurten set.
+    if len(gdf) and (TARGET_N or MIN_SPACING_M):
         gdf_proj = gdf.to_crs(PROJECTED_CRS)
         gdf_proj = _thin_to_target(gdf_proj, TARGET_N, STRATUM_M,
-                                   min_spacing_m=MIN_SPACING_M)
+                                   min_spacing_m=MIN_SPACING_M,
+                                   buurten_proj=buurten, min_per_buurt=MIN_PER_BUURT)
         gdf = gdf.loc[gdf["pano_id"].isin(gdf_proj["pano_id"])].reset_index(drop=True)
-        print(f"Density-proportional thinning to ~{TARGET_N} points "
-              f"(STRATUM_M={STRATUM_M:.0f} m, floor={MIN_SPACING_M} m): {len(gdf)} points.")
+        print(f"Thinned region-wide to {len(gdf)} points "
+              f"(target ~{TARGET_N} total, floor={MIN_SPACING_M} m, min {MIN_PER_BUURT}/buurt).")
 
     worklist = gdf.drop(columns="geometry").reset_index(drop=True)
     os.makedirs(os.path.dirname(WORKLIST_PATH), exist_ok=True)
@@ -702,7 +878,7 @@ def main(argv=None):
                          "an unchanged config (new panoramas published, or a refreshed boundary "
                          "cache), which the cache stamp cannot detect.")
     ap.add_argument("--all-buurten", action="store_true",
-                    help="download panoramas across the WHOLE municipality, including buurten "
+                    help="download panoramas across the WHOLE study region, including buurten "
                          "with no CBS SES-WOA score (ports, industrial estates, parks, rail "
                          "yards). By default (RESTRICT_TO_SCORED_BUURTEN) only scored buurten "
                          "are fetched, since unscored ones cannot contribute a training target.")

@@ -23,7 +23,7 @@ import geopandas as gpd
 
 from directory_filepaths import (
     boundaries_file, ses_file,
-    MUNICIPALITY_CODE, CBS_TABLE, CBS_YEAR, JOIN_KEY,
+    MUNICIPALITY_CODES, CBS_TABLE, CBS_YEAR, JOIN_KEY,
     PROJECTED_CRS, GEOGRAPHIC_CRS,
 )
 
@@ -34,10 +34,14 @@ USER_AGENT = "StreetViewDeprivation-Amsterdam/1.0 (academic research; n.s.malles
 PDOK_WFS = "https://service.pdok.nl/cbs/wijkenbuurten/2024/wfs/v1_0"
 CBS_ODATA = "https://opendata.cbs.nl/ODataApi/odata"
 
-# Generous bounding box covering the whole Amsterdam municipality (lat/lon, WGS84).
-# Used only to limit the PDOK WFS request; the result is then filtered to the
-# municipality by gemeentecode, so the exact bbox is not critical.
-_AMS_BBOX_LATLON = (52.27, 4.72, 52.44, 5.08)  # (min_lat, min_lon, max_lat, max_lon)
+# Generous bounding box covering all study-region municipalities (lat/lon, WGS84).
+# Used only to limit the PDOK WFS request; the result is then filtered to the chosen
+# municipalities by gemeentecode, so the exact bbox is not critical — it only has to
+# contain them all. It extends east to ~5.40 lon for Almere and south to ~52.23 lat for
+# Amstelveen (verified municipality extents: Amsterdam lon 4.73-5.11/lat 52.28-52.43,
+# Amstelveen lon 4.80-4.91/lat 52.24-52.33, Diemen lon 4.94-5.04/lat 52.31-52.36,
+# Almere lon 5.12-5.38/lat 52.30-52.44).
+_AMS_BBOX_LATLON = (52.23, 4.70, 52.45, 5.40)  # (min_lat, min_lon, max_lat, max_lon)
 
 # CBS SES-WOA score columns in table 86092NED (confirmed via the OData metadata).
 #   GemiddeldeScore_29 = SES-WOA total score (primary target)
@@ -63,11 +67,13 @@ def _session():
 # ---------------------------------------------------------------------------
 def get_amsterdam_buurten(force=False):
     """
-    Return a GeoDataFrame of Amsterdam municipality buurten (land only), in the
-    projected CRS (EPSG:28992). Cached as a GeoPackage at `boundaries_file`.
+    Return a GeoDataFrame of the study-region buurten (land only) for every gemeente in
+    MUNICIPALITY_CODES, in the projected CRS (EPSG:28992). Cached as a GeoPackage at
+    `boundaries_file`.
 
     Columns include `buurtcode` (the JOIN_KEY, e.g. 'BU0363AA01'), `buurtnaam`,
-    `wijkcode` and `gemeentecode`.
+    `wijkcode` and `gemeentecode` (`GM0363` etc.) — the last lets downstream code
+    process each municipality separately.
     """
     if os.path.exists(boundaries_file) and not force:
         return gpd.read_file(boundaries_file)
@@ -87,8 +93,8 @@ def get_amsterdam_buurten(force=False):
     r.raise_for_status()
     gdf = gpd.read_file(io.BytesIO(r.content))
 
-    gm_code = f"GM{MUNICIPALITY_CODE}"
-    gdf = gdf[gdf["gemeentecode"] == gm_code].copy()
+    gm_codes = {f"GM{c}" for c in MUNICIPALITY_CODES}
+    gdf = gdf[gdf["gemeentecode"].isin(gm_codes)].copy()
     # Drop artificial "water" buurten (large inland water bodies), keeping land units.
     if "water" in gdf.columns:
         gdf = gdf[gdf["water"] != "JA"].copy()
@@ -107,8 +113,9 @@ def get_amsterdam_buurten(force=False):
 # ---------------------------------------------------------------------------
 def get_ses_woa(force=False):
     """
-    Return a DataFrame of CBS SES-WOA scores per Amsterdam buurt for CBS_YEAR,
-    keyed on `buurtcode` (the JOIN_KEY). Cached as a CSV at `ses_file`.
+    Return a DataFrame of CBS SES-WOA scores per buurt for CBS_YEAR, for every gemeente
+    in MUNICIPALITY_CODES, keyed on `buurtcode` (the JOIN_KEY). Cached as a CSV at
+    `ses_file`.
 
     Columns: buurtcode, ses_woa_score (total, the primary target),
              ses_welvaart, ses_opleiding, ses_arbeidsverleden (the three
@@ -119,9 +126,12 @@ def get_ses_woa(force=False):
 
     os.makedirs(os.path.dirname(ses_file), exist_ok=True)
     select = ["WijkenEnBuurten", "Perioden"] + list(_SES_COLS.keys())
-    # OData filter: Amsterdam buurten (codes start 'BU0363') for the chosen period.
-    flt = (f"startswith(WijkenEnBuurten,'BU{MUNICIPALITY_CODE}') "
-           f"and Perioden eq '{CBS_YEAR}'")
+    # OData filter: buurten in any study-region gemeente (codes start 'BU<code>') for the
+    # chosen period. Buurt codes are prefixed by their gemeente code, so a per-municipality
+    # startswith OR'd together selects exactly the study region.
+    code_filter = " or ".join(
+        f"startswith(WijkenEnBuurten,'BU{c}')" for c in MUNICIPALITY_CODES)
+    flt = f"({code_filter}) and Perioden eq '{CBS_YEAR}'"
     params = {"$format": "json", "$select": ",".join(select), "$filter": flt}
 
     rows, url = [], f"{CBS_ODATA}/{CBS_TABLE}/TypedDataSet"
