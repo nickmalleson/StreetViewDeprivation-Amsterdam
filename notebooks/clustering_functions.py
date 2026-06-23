@@ -7,7 +7,7 @@ import random
 from kneed import KneeLocator
 import matplotlib.pyplot as plt
 
-# Important: this is the number of clusters used in the clustering scripts
+# Important: this is the 'optimal' number of clusters used in the clustering scripts
 global_k = 5
 
 # Which summary statistic to use when aggregating per-image embeddings to per-LSOA.
