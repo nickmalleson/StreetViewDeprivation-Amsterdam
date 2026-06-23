@@ -33,7 +33,15 @@ full scale, and `data/` is empty (everything regenerates). To run the real study
 - **CRS**: **EPSG:28992** for projected ops; WGS84 (4326) for point joins and Earth Engine / GeoTIFF.
 - **Notebook 8** predicts the **3 SES-WOA components** (welvaart, opleidingsniveau, arbeidsverleden) —
   SES-WOA is a single composite with no separate domains, so there are no IMD-style domains to predict.
-- **Satellite (9a/9b)**: AlphaEarth, AOI = Amsterdam, zonal units = buurten.
+- **Satellite (9a/9b)**: AlphaEarth, AOI = Amsterdam, zonal units = buurten. 9a builds three
+  per-buurt feature variants from the *same* raster: **whole-buurt zonal** (every 10 m pixel in the
+  buurt — the original approach) and two **road-following** variants that re-aggregate the raster over
+  the street-view sampling support (the panorama point locations from the H5, same point→buurt join as
+  notebook 3): `road_point` (single pixel under each point; a weak sanity baseline) and `road_buffer`
+  (median of pixels within `ROAD_BUFFER_M`, default 20 m — the satellite analogue of the panorama's
+  outward gaze). 9b fits/compares all three against the street-view baseline to test whether
+  AlphaEarth's weaker fit is partly a *sampling* artefact (built on/around roads where people are)
+  rather than a *sensor* one. The road variants are the only part of 9a that needs the panorama H5.
 
 ## Config (the single place the study is defined)
 - `notebooks/directory_filepaths.py` — paths + `MUNICIPALITY_CODES` (the study-region gemeente
