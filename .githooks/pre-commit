@@ -1,0 +1,21 @@
+#!/bin/sh
+# pre-commit: strip bulky interactive-map (folium / leaflet) outputs from staged
+# notebooks before they enter git history. See tools/strip_map_outputs.py.
+#
+# Version-controlled hook — enable it once per clone with:  make install-hooks
+# (which sets core.hooksPath to .githooks). Never blocks a commit on its own.
+
+root=$(git rev-parse --show-toplevel) || exit 0
+
+# Notebooks staged for this commit (added / copied / modified).
+nbs=$(git diff --cached --name-only --diff-filter=ACM -- '*.ipynb')
+[ -z "$nbs" ] && exit 0
+
+# Strip in place, then re-stage anything that changed so the commit is clean.
+python3 "$root/tools/strip_map_outputs.py" $nbs || exit 0
+
+echo "$nbs" | while IFS= read -r nb; do
+    [ -n "$nb" ] && git add -- "$nb"
+done
+
+exit 0

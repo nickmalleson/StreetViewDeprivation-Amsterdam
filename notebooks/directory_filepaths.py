@@ -75,3 +75,40 @@ TARGET_COL = "ses_woa_score"
 # CBS flags the most recent year as provisional - see DATA_PROVENANCE.md).
 CBS_TABLE = "86092NED"
 CBS_YEAR  = "2023JJ00"
+
+# ---------------------------------------------------------------------------
+# Plot defaults (keep notebook-embedded figures small)
+# ---------------------------------------------------------------------------
+# Inline figures are rasterised to PNG at the figure DPI. matplotlib's default
+# (100) makes the basemap maps ~1 MB each and bloats the committed notebooks.
+# Dropping to 72 keeps the same layout at lower resolution (roughly half the file
+# size) and is ample for on-screen / GitHub viewing. Every notebook imports this
+# module before it plots, so the default applies project-wide. Override per figure
+# with plt.savefig(dpi=...) where a crisper export is needed; for the photographic
+# basemap maps a far bigger saving comes from saving them as JPEG instead of PNG.
+import matplotlib as mpl
+mpl.rcParams["figure.dpi"] = 72
+
+
+def show_jpeg(fig=None, quality=85, dpi=None):
+    """Display a figure inline as a JPEG (instead of the default PNG) and close it.
+
+    Photographic figures — contextily basemaps and raster ``imshow`` maps — are far
+    smaller as JPEG than as the notebook's default inline PNG (roughly 5-6x; e.g. a
+    basemap map of ~1 MB PNG becomes ~0.2 MB JPEG) with no visible loss, which stops
+    these heavy cells bloating the committed notebooks. Use it *in place of*
+    ``plt.show()`` for such cells only; keep ``plt.show()`` (PNG) for line / scatter
+    plots, where JPEG would smear text and gridlines. ``fig`` defaults to the current
+    figure; ``dpi`` defaults to the figure DPI set above.
+    """
+    import io
+    import matplotlib.pyplot as plt
+    from IPython.display import Image, display
+
+    if fig is None:
+        fig = plt.gcf()
+    buf = io.BytesIO()
+    fig.savefig(buf, format="jpeg", dpi=dpi, bbox_inches="tight",
+                pil_kwargs={"quality": quality})
+    plt.close(fig)
+    display(Image(data=buf.getvalue(), format="jpeg"))
