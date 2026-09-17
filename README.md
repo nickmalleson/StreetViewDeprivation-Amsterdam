@@ -172,7 +172,7 @@ Predicts the three SES-WOA components per cluster + global. **Output:** R²/NRMS
 
 ### 9a-DownloadAlphaEarthEmbeddings.ipynb
 Downloads AlphaEarth satellite embeddings for Amsterdam and computes per-buurt zonal stats. **Requires
-GEE authentication + a Cloud project and a manual GeoTIFF download** (flagged inline).
+GEE authentication + a Cloud project (set the `GEE_PROJECT` env var) and a manual GeoTIFF download** (flagged inline).
 
 ### 9b-RunModelWithAlphaEarthEmbeddings.ipynb
 XGBoost on the 64-dim satellite embeddings (same methodology as notebook 4), enabling a street-view vs
