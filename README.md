@@ -3,7 +3,13 @@
 Can the socio-economic status of a neighbourhood be predicted from what its streets *look like*?
 This repository provides an end-to-end, fully open workflow that tests exactly that for the
 **municipality of Amsterdam**, using openly-licensed 360° street-level panoramas and openly-published
-socio-economic data.
+socio-economic data. 
+
+The code has predominantly been vibe-created by Claude, especially the data acquisition stuff.
+Although a lot of the method and the later stages in the analysis  (modelling deprivation etc.) 
+came from a repository I worked on previously called
+[INTEGRATE-Embeddings-Deprivation](https://github.com/Urban-Analytics/INTEGRATE-Embeddings-Deprivation). 
+That code was supported by AI but was mostly written by me and colleagues
 
 The workflow:
 
